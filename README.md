@@ -1,7 +1,7 @@
 Third place solution for AutoDl CV2 challenge 
 ======================================
 
-The details will be provided soon
+The model.py file and other dependent files are located in AutoDL_ingestion_program folder
 
 ## Information about competition
 

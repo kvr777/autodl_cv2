@@ -9,10 +9,12 @@ import torchvision as tv
 import numpy as np
 
 import skeleton
-from architectures.resnet import ResNet18
+from architectures.resnet import ResNet18, ResNet34
+from architectures.efficientnet import EfficientNetB0, EfficientNetB1, EfficientNetB2
+from architectures.squeezenet import SqueezeneNet11
+from architectures.mobilenet import MobileNetv2
 from skeleton.projects import LogicModel, get_logger
 from skeleton.projects.others import NBAC, AUC
-
 
 torch.backends.cudnn.benchmark = True
 threads = [
@@ -34,7 +36,6 @@ class Model(LogicModel):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         in_channels = self.info['dataset']['shape'][-1]
         num_class = self.info['dataset']['num_class']
-        # torch.cuda.synchronize()
 
         LOGGER.info('[init] session')
         [t.join() for t in threads]
@@ -43,16 +44,20 @@ class Model(LogicModel):
         self.session = tf.Session()
 
         LOGGER.info('[init] Model')
-        Network = ResNet18  # ResNet18  # BasicNet, SENet18, ResNet18
+
+        if self.info['dataset']['size'] > 25000 and self.info['dataset']['shape'][0] >= 256:
+            Network = EfficientNetB0
+        else:
+            Network = ResNet18
         self.model = Network(in_channels, num_class)
         self.model_pred = Network(in_channels, num_class).eval()
         # torch.cuda.synchronize()
 
         LOGGER.info('[init] weight initialize')
-        if Network in [ResNet18]:
+        if Network in [ResNet18, SqueezeneNet11, MobileNetv2, ResNet34,
+                       EfficientNetB0, EfficientNetB1, EfficientNetB2]:
             model_path = os.path.join(base_dir, 'models')
             LOGGER.info('model path: %s', model_path)
-
             self.model.init(model_dir=model_path, gain=1.0)
         else:
             self.model.init(gain=1.0)
@@ -72,14 +77,14 @@ class Model(LogicModel):
         epsilon = min(0.1, max(0.001, 0.001 * pow(num_class / 10, 2)))
         if self.is_multiclass():
             self.model.loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
-            # self.model.loss_fn = skeleton.nn.BinaryCrossEntropyLabelSmooth(num_class, epsilon=epsilon, reduction='none')
             self.tau = 8.0
-            LOGGER.info('[update_model] %s (tau:%f, epsilon:%f)', self.model.loss_fn.__class__.__name__, self.tau, epsilon)
+            LOGGER.info('[update_model] %s (tau:%f, epsilon:%f)', self.model.loss_fn.__class__.__name__, self.tau,
+                        epsilon)
         else:
             self.model.loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
-            # self.model.loss_fn = skeleton.nn.CrossEntropyLabelSmooth(num_class, epsilon=epsilon)
             self.tau = 8.0
-            LOGGER.info('[update_model] %s (tau:%f, epsilon:%f)', self.model.loss_fn.__class__.__name__, self.tau, epsilon)
+            LOGGER.info('[update_model] %s (tau:%f, epsilon:%f)', self.model.loss_fn.__class__.__name__, self.tau,
+                        epsilon)
         self.model_pred.loss_fn = self.model.loss_fn
 
         self.init_opt()
@@ -104,7 +109,6 @@ class Model(LogicModel):
         self.optimizer = skeleton.optim.ScheduledOptimizer(
             params,
             torch.optim.SGD,
-            # skeleton.optim.SGDW,
             steps_per_epoch=steps_per_epoch,
             clip_grad_max_norm=None,
             lr=scheduler_lr,
@@ -128,7 +132,6 @@ class Model(LogicModel):
 
         self.use_test_time_augmentation = self.info['loop']['test'] > 1
 
-        # Adapt Apply Fast auto aug
         if self.hyper_params['conditions']['use_fast_auto_aug'] and \
                 (train_score > 0.995 or self.info['terminate']) and \
                 remaining_time_budget > 120 and \
@@ -167,7 +170,8 @@ class Model(LogicModel):
 
                 metrics = []
                 for policy_eval in range(num_sub_policy):
-                    valid_dataloader = self.build_or_get_dataloader('valid', self.datasets['valid'], self.datasets['num_valids'])
+                    valid_dataloader = self.build_or_get_dataloader('valid', self.datasets['valid'],
+                                                                    self.datasets['num_valids'])
                     # original_valid_batch_size = valid_dataloader.batch_sampler.batch_size
                     # valid_dataloader.batch_sampler.batch_size = batch_size
 
@@ -213,7 +217,8 @@ class Model(LogicModel):
         else:
             logits = torch.softmax(logits, dim=-1)
             _, k = logits.max(-1)
-            prediction = torch.zeros(logits.shape, dtype=logits.dtype, device=logits.device).scatter_(-1, k.view(-1, 1), 1.0)
+            prediction = torch.zeros(logits.shape, dtype=logits.dtype, device=logits.device).scatter_(-1, k.view(-1, 1),
+                                                                                                      1.0)
         return logits, prediction
 
     def get_model_state(self):
@@ -233,10 +238,6 @@ class Model(LogicModel):
             if not self.is_multiclass():
                 labels = labels.argmax(dim=-1)
 
-            # batch_size = examples.size(0)
-            # examples = torch.cat([examples, torch.flip(examples, dims=[-1])], dim=0)
-            # labels = torch.cat([labels, labels], dim=0)
-
             skeleton.nn.MoveToHook.to((examples, labels), self.device, self.is_half)
             logits, loss = model(examples, labels, tau=self.tau)
             loss.backward()
@@ -245,10 +246,6 @@ class Model(LogicModel):
             optimizer.update(maximum_epoch=max_epoch)
             optimizer.step()
             model.zero_grad()
-
-            # logits1, logits2 = torch.split(logits, batch_size, dim=0)
-            # logits = (logits1 + logits2) / 2.0
-
             logits, prediction = self.activation(logits.float())
             tpr, tnr, nbac = NBAC(prediction, original_labels.float())
             auc = AUC(logits, original_labels.float())
@@ -346,9 +343,6 @@ class Model(LogicModel):
         predictions = []
         self.model_pred.eval()
         for step, (examples, labels) in enumerate(dataloader):
-            # examples = examples[0]
-            # skeleton.nn.MoveToHook.to((examples, labels), self.device, self.is_half)
-
             batch_size = examples.size(0)
 
             # Test-Time Augment flip
